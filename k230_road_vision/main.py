@@ -8,7 +8,7 @@ import gc
 import sys
 import math
 
-BUILD_ID = "K230_ROAD_FINAL_DEBUG_20260723_03_LCD"
+BUILD_ID = "K230_ROAD_DUAL_BAND_FULL_WIDTH_20260723_06"
 
 # ---- 板端硬件库（仅在 K230 上可用） ----
 try:
@@ -39,22 +39,35 @@ DETECT_PIXFMT = "RGB888"
 # 道路 ROI
 ROI_TOP = 30
 ROI_BOTTOM = 220
-ROI_LEFT = 20
-ROI_RIGHT = 300
+ROI_LEFT = 0
+ROI_RIGHT = DETECT_WIDTH
+
+# Two narrow processing bands for the fixed real-camera view.
+CONTROL_BAND_TOP = 148
+CONTROL_BAND_BOTTOM = 177
+CONTROL_SAMPLE_ROWS = 7
+LOOKAHEAD_BAND_TOP = 68
+LOOKAHEAD_BAND_BOTTOM = 101
+LOOKAHEAD_SAMPLE_ROWS = 5
 
 # 黑线检测阈值
-LINE_GRAY_THRESH = 80
+# RGB colour spread rejects the red centre tape.
+LINE_GRAY_THRESH = 105
+LINE_MAX_COLOR_SPREAD = 45
+LINE_ALWAYS_DARK_MAX = 70
 CANNY_LOW = 30
 CANNY_HIGH = 90
 MORPH_KERNEL = 3
 
 # 道路几何 — 采样行
-NUM_SAMPLE_ROWS = 12
+NUM_SAMPLE_ROWS = CONTROL_SAMPLE_ROWS + LOOKAHEAD_SAMPLE_ROWS
 MIN_LINE_WIDTH = 4
 MAX_LINE_WIDTH = 40
 EXPECTED_ROAD_WIDTH_MIN = 30
-EXPECTED_ROAD_WIDTH_MAX = 200
+EXPECTED_ROAD_WIDTH_MAX = DETECT_WIDTH - 1
 BOUNDARY_SEARCH_MARGIN = 10
+
+WIDE_JUNCTION_MIN_WIDTH = 55
 
 # 道路几何 — 航向偏差计算
 HEADING_NEAR_ROWS = [0, 1, 2, 3]
@@ -374,6 +387,9 @@ class BoundaryResult:
         self.right_valid = False
         self.center_points = []
         self.num_valid_rows = 0
+        self.sample_y = []
+        self.control_center_points = []
+        self.lookahead_center_points = []
         self.all_segments = []     # 每行所有黑线段 [(start, end), ...] per row
 
 
@@ -427,9 +443,44 @@ def _gray_pixel(image_array, y, x, ndim=None):
     return int(value) & 0xFF
 
 
+def _is_black_pixel(image_array, y, x, ndim=None):
+    """Detect dark neutral tape while rejecting chromatic red tape."""
+    if ndim is None:
+        try:
+            ndim = len(image_array.shape)
+        except Exception:
+            ndim = 0
+
+    if ndim >= 3 and int(image_array.shape[2]) >= 3:
+        r = int(image_array[y, x, 0]) & 0xFF
+        g = int(image_array[y, x, 1]) & 0xFF
+        b = int(image_array[y, x, 2]) & 0xFF
+        return _is_black_rgb(r, g, b)
+
+    value = image_array[y][x] if ndim == 0 else image_array[y, x]
+    if isinstance(value, (tuple, list)) and len(value) >= 3:
+        r = int(value[0]) & 0xFF
+        g = int(value[1]) & 0xFF
+        b = int(value[2]) & 0xFF
+        return _is_black_rgb(r, g, b)
+    return (int(value) & 0xFF) < LINE_GRAY_THRESH
+
+
+def _is_black_rgb(r, g, b):
+    """Fast RGB predicate for values already copied out of the ndarray."""
+    hi = max(r, g, b)
+    if hi <= LINE_ALWAYS_DARK_MAX:
+        return True
+    lo = min(r, g, b)
+    if hi - lo > LINE_MAX_COLOR_SPREAD:
+        return False
+    return ((77 * r + 150 * g + 29 * b) >> 8) < LINE_GRAY_THRESH
+
+
 class RoadBoundaryExtractor:
     def __init__(self, detect_w=320, detect_h=240,
-                 roi_top=30, roi_bottom=220, roi_left=20, roi_right=300,
+                 roi_top=ROI_TOP, roi_bottom=ROI_BOTTOM,
+                 roi_left=ROI_LEFT, roi_right=ROI_RIGHT,
                  gray_thresh=80,
                  num_rows=NUM_SAMPLE_ROWS,
                  min_line_w=MIN_LINE_WIDTH,
@@ -447,14 +498,24 @@ class RoadBoundaryExtractor:
         self.max_line_w = max_line_w
         self.search_margin = search_margin
 
-        self.sample_y = []
-        roi_h = roi_bottom - roi_top
-        for i in range(num_rows):
-            y = roi_bottom - 1 - i * roi_h // max(1, num_rows - 1)
-            self.sample_y.append(max(roi_top, min(roi_bottom - 1, y)))
+        self.control_sample_y = self._make_band_rows(
+            CONTROL_BAND_TOP, CONTROL_BAND_BOTTOM, CONTROL_SAMPLE_ROWS)
+        self.lookahead_sample_y = self._make_band_rows(
+            LOOKAHEAD_BAND_TOP, LOOKAHEAD_BAND_BOTTOM, LOOKAHEAD_SAMPLE_ROWS)
+        self.sample_y = self.control_sample_y + self.lookahead_sample_y
+        self.rgb_path_reported = False
+
+    @staticmethod
+    def _make_band_rows(top, bottom, count):
+        rows = []
+        for i in range(count):
+            y = bottom - 1 - i * (bottom - top - 1) // max(1, count - 1)
+            rows.append(y)
+        return rows
 
     def extract(self, gray_img) -> BoundaryResult:
         result = BoundaryResult()
+        result.sample_y = list(self.sample_y)
         try:
             shape = gray_img.shape
             ndim = len(shape)
@@ -482,10 +543,16 @@ class RoadBoundaryExtractor:
             if left_x is not None and right_x is not None:
                 cx = (left_x + right_x) // 2
                 result.center_points.append((cx, y))
+                if y in self.control_sample_y:
+                    result.control_center_points.append((cx, y))
+                else:
+                    result.lookahead_center_points.append((cx, y))
                 result.num_valid_rows += 1
 
-        result.left_valid = len(result.left_points) >= self.num_rows // 3
-        result.right_valid = len(result.right_points) >= self.num_rows // 3
+        min_valid = max(2, CONTROL_SAMPLE_ROWS // 2)
+        control_y = set(self.control_sample_y)
+        result.left_valid = sum(1 for _, y in result.left_points if y in control_y) >= min_valid
+        result.right_valid = sum(1 for _, y in result.right_points if y in control_y) >= min_valid
         return result
 
     def _find_black_segments(self, image_array, y, image_w, ndim):
@@ -505,6 +572,31 @@ class RoadBoundaryExtractor:
                     row_values = list(row_view)
             except Exception:
                 row_values = None
+        elif ndim >= 3:
+            try:
+                # Critical K230 fast path: three native channel slices per row.
+                # Separate flat lists avoid thousands of slow ndarray scalar
+                # reads and avoid allocating 280 small RGB sub-lists per row.
+                row_values = (
+                    image_array[y, self.roi_left:x_end, 0].tolist(),
+                    image_array[y, self.roi_left:x_end, 1].tolist(),
+                    image_array[y, self.roi_left:x_end, 2].tolist(),
+                )
+            except Exception:
+                try:
+                    row_view = image_array[y, self.roi_left:x_end, 0:3]
+                    row_values = row_view.tolist()
+                except Exception:
+                    row_values = None
+            if not self.rgb_path_reported:
+                if isinstance(row_values, tuple):
+                    print("[PERF] RGB row path: channel-slice fast")
+                elif row_values is not None:
+                    print("[PERF] RGB row path: packed-row fast")
+                else:
+                    print("[PERF] WARNING: RGB row slicing unavailable; "
+                          "slow scalar fallback")
+                self.rgb_path_reported = True
         elif ndim == 0:
             try:
                 row_values = image_array[y][self.roi_left:x_end]
@@ -513,15 +605,56 @@ class RoadBoundaryExtractor:
 
         if row_values is not None:
             i = 0
-            row_len = len(row_values)
+            is_rgb_planes = (
+                isinstance(row_values, tuple) and len(row_values) == 3 and
+                isinstance(row_values[0], list)
+            )
+            row_len = len(row_values[0]) if is_rgb_planes else len(row_values)
+            is_rgb_row = (
+                not is_rgb_planes and row_len > 0 and
+                isinstance(row_values[0], (tuple, list)) and
+                len(row_values[0]) >= 3
+            )
+            is_black_rgb = _is_black_rgb
             while i < row_len:
-                if int(row_values[i]) < self.gray_thresh:
+                if is_rgb_planes:
+                    is_dark = is_black_rgb(
+                        int(row_values[0][i]) & 0xFF,
+                        int(row_values[1][i]) & 0xFF,
+                        int(row_values[2][i]) & 0xFF)
+                else:
+                    value = row_values[i]
+                if is_rgb_row:
+                    is_dark = _is_black_rgb(
+                        int(value[0]) & 0xFF,
+                        int(value[1]) & 0xFF,
+                        int(value[2]) & 0xFF)
+                elif not is_rgb_planes:
+                    is_dark = int(value) < self.gray_thresh
+                if is_dark:
                     start = i
-                    while i < row_len and int(row_values[i]) < self.gray_thresh:
+                    i += 1
+                    while i < row_len:
+                        if is_rgb_planes:
+                            is_dark = is_black_rgb(
+                                int(row_values[0][i]) & 0xFF,
+                                int(row_values[1][i]) & 0xFF,
+                                int(row_values[2][i]) & 0xFF)
+                        else:
+                            value = row_values[i]
+                        if is_rgb_row:
+                            is_dark = is_black_rgb(
+                                int(value[0]) & 0xFF,
+                                int(value[1]) & 0xFF,
+                                int(value[2]) & 0xFF)
+                        elif not is_rgb_planes:
+                            is_dark = int(value) < self.gray_thresh
+                        if not is_dark:
+                            break
                         i += 1
                     end = i - 1
                     width = end - start + 1
-                    if self.min_line_w <= width <= self.max_line_w:
+                    if width >= self.min_line_w:
                         segments.append((
                             self.roi_left + start,
                             self.roi_left + end,
@@ -533,14 +666,14 @@ class RoadBoundaryExtractor:
         # RGB888 or unusual ndarray fallback.  It still scans only sample rows.
         i = self.roi_left
         while i < x_end:
-            if _gray_pixel(image_array, y, i, ndim) < self.gray_thresh:
+            if _is_black_pixel(image_array, y, i, ndim):
                 start = i
                 while i < x_end and \
-                      _gray_pixel(image_array, y, i, ndim) < self.gray_thresh:
+                      _is_black_pixel(image_array, y, i, ndim):
                     i += 1
                 end = i - 1
                 w = end - start + 1
-                if self.min_line_w <= w <= self.max_line_w:
+                if w >= self.min_line_w:
                     segments.append((start, end))
             else:
                 i += 1
@@ -557,12 +690,12 @@ class RoadBoundaryExtractor:
             w = seg[1] - seg[0] + 1
             if cx < mid_x:
                 d = mid_x - cx
-                if d < left_dist and w < self.max_line_w * 2:
+                if d < left_dist and w <= self.max_line_w:
                     left_dist = d
                     left_best = seg
             else:
                 d = cx - mid_x
-                if d < right_dist and w < self.max_line_w * 2:
+                if d < right_dist and w <= self.max_line_w:
                     right_dist = d
                     right_best = seg
 
@@ -604,19 +737,26 @@ class RoadGeometry:
             rp = boundary.right_points
 
             centers = []
-            widths = []
+            control_centers = []
+            control_widths = []
             for (lx, ly) in lp:
                 rx = self._find_right_at_y(rp, ly, 10)
                 if rx is not None:
-                    centers.append(((lx + rx) / 2.0, ly))
-                    widths.append(abs(rx - lx))
+                    center = ((lx + rx) / 2.0, ly)
+                    width = abs(rx - lx)
+                    centers.append(center)
+                    if CONTROL_BAND_TOP <= ly < CONTROL_BAND_BOTTOM:
+                        control_centers.append(center)
+                        control_widths.append(width)
 
-            if len(centers) >= 3:
-                g.road_width = float(sum(widths)) / max(len(widths), 1)
+            if len(control_centers) >= 3:
+                # Steering position and physical road width come only from the
+                # lower control band. Upper samples affect heading/pre-judgment.
+                g.road_width = float(sum(control_widths)) / len(control_widths)
                 self.hist_road_width = g.road_width
                 self.hist_width_ready = True
 
-                near_pts = sorted(centers, key=lambda p: p[1], reverse=True)[:4]
+                near_pts = sorted(control_centers, key=lambda p: p[1], reverse=True)[:4]
                 avg_near_x = sum(p[0] for p in near_pts) / max(len(near_pts), 1)
                 g.lateral_error = avg_near_x - self.cx_det
 
@@ -896,7 +1036,8 @@ class RoadStructureDetector:
         else:
             self.right_branch_hits = max(0, self.right_branch_hits - 1)
 
-        if width_increase and (has_left_feature or has_right_feature):
+        wide_cross = self._has_wide_crossbar(boundary)
+        if wide_cross or (width_increase and has_left_feature and has_right_feature):
             self.intersection_hits += 1
         else:
             self.intersection_hits = max(0, self.intersection_hits - 1)
@@ -1001,13 +1142,10 @@ class RoadStructureDetector:
         if num_rows == 0:
             return False, False, -1
 
-        roi_top = 30
-        roi_bottom = 220
-
         for i, segments in enumerate(boundary.all_segments):
             if not segments:
                 continue
-            y = roi_bottom - 1 - i * (roi_bottom - roi_top) // max(1, num_rows - 1)
+            y = boundary.sample_y[i] if i < len(boundary.sample_y) else -1
 
             lx = left_by_y.get(y)
             rx = right_by_y.get(y)
@@ -1036,6 +1174,18 @@ class RoadStructureDetector:
                         extra_y = y
 
         return extra_left, extra_right, extra_y
+
+    def _has_wide_crossbar(self, boundary):
+        """Detect a horizontal crossbar on at least two look-ahead rows."""
+        hits = 0
+        for i, segments in enumerate(boundary.all_segments):
+            y = boundary.sample_y[i] if i < len(boundary.sample_y) else -1
+            if not (LOOKAHEAD_BAND_TOP <= y < LOOKAHEAD_BAND_BOTTOM):
+                continue
+            if any((end - start + 1) >= WIDE_JUNCTION_MIN_WIDTH
+                   for start, end in segments):
+                hits += 1
+        return hits >= 2
 
     def _estimate_junction_stage(self, junction_y_px):
         if junction_y_px <= 0:
@@ -1114,22 +1264,22 @@ class ImagePreprocessor:
         self.roi_left = ROI_LEFT
         self.roi_right = ROI_RIGHT
         self.detect_w = DETECT_WIDTH
+        self.frame_index = 0
+        self.last_anomaly_flags = 0
 
     def extract_rows(self, img):
-        # CanMV performs this conversion in native code.  With display disabled
-        # it is safe to reuse the captured image as the grayscale working image.
         try:
-            gray_img = img.to_grayscale()
-            if gray_img is None:
-                gray_img = img
-            image_np = gray_img.to_numpy_ref()
+            # Keep RGB so the extractor can reject the red centre tape.
+            image_np = img.to_numpy_ref()
         except Exception as e:
-            # Keep an RGB888 fallback for firmware/API differences.
             try:
-                image_np = img.to_numpy_ref()
+                gray_img = img.to_grayscale()
+                if gray_img is None:
+                    gray_img = img
+                image_np = gray_img.to_numpy_ref()
                 if not ImagePreprocessor._shape_printed:
-                    print("[PREPROC] grayscale conversion unavailable; "
-                          "using RGB888 fallback:", repr(e))
+                    print("[PREPROC] RGB888 unavailable; grayscale fallback "
+                          "cannot reject red tape:", repr(e))
             except Exception as fallback_error:
                 print("[PREPROC] image conversion failed:", repr(fallback_error))
                 return None, 0
@@ -1141,7 +1291,6 @@ class ImagePreprocessor:
                 print("[PREPROC] ndarray shape unavailable:", repr(e))
             ImagePreprocessor._shape_printed = True
 
-        flags = 0
         try:
             ndim = len(image_np.shape)
             h = int(image_np.shape[0])
@@ -1150,25 +1299,32 @@ class ImagePreprocessor:
             print("[PREPROC] invalid ndarray:", repr(e))
             return None, 0
 
-        total = 0
-        count = 0
-        step = max(1, (self.roi_right - self.roi_left) // 20)
-        x_end = min(self.roi_right, w)
-        for y in self.sample_y:
-            if y < 0 or y >= h:
-                continue
-            for x in range(self.roi_left, x_end, step):
-                total += _gray_pixel(image_np, y, x, ndim)
-                count += 1
+        # Exposure is slow-changing telemetry, not steering input. Sampling it
+        # every tenth frame removes another 720 RGB ndarray scalar reads from
+        # nine out of ten frames.
+        self.frame_index += 1
+        if self.frame_index % 10 == 1:
+            total = 0
+            count = 0
+            step = max(1, (self.roi_right - self.roi_left) // 20)
+            x_end = min(self.roi_right, w)
+            for y in self.sample_y:
+                if y < 0 or y >= h:
+                    continue
+                for x in range(self.roi_left, x_end, step):
+                    total += _gray_pixel(image_np, y, x, ndim)
+                    count += 1
 
-        if count:
-            avg = total / count
-            if avg < 25:
-                flags |= ANOMALY_UNDEREXPOSED
-            elif avg > 230:
-                flags |= ANOMALY_OVEREXPOSED
+            flags = 0
+            if count:
+                avg = total / count
+                if avg < 25:
+                    flags |= ANOMALY_UNDEREXPOSED
+                elif avg > 230:
+                    flags |= ANOMALY_OVEREXPOSED
+            self.last_anomaly_flags = flags
 
-        return image_np, flags
+        return image_np, self.last_anomaly_flags
 
 
 class RoadUART:
@@ -1664,7 +1820,7 @@ class K230RoadVision:
                 img.draw_circle(int(cx), int(cy), 1, color=(0, 255, 0), fill=True)
             # Camera/vehicle reference center.
             cx_line = int(DETECT_WIDTH / 2)
-            img.draw_line(cx_line, ROI_TOP, cx_line, ROI_BOTTOM,
+            img.draw_line(cx_line, LOOKAHEAD_BAND_TOP, cx_line, CONTROL_BAND_BOTTOM,
                           color=(255, 255, 0), thickness=1)
 
             # Connect detected road-center samples.
@@ -1675,9 +1831,14 @@ class K230RoadVision:
                 img.draw_line(int(x0), int(y0), int(x1), int(y1),
                               color=(0, 255, 0), thickness=2)
 
-            img.draw_rectangle(ROI_LEFT, ROI_TOP,
-                               ROI_RIGHT - ROI_LEFT, ROI_BOTTOM - ROI_TOP,
-                               color=(100, 100, 100), thickness=1)
+            img.draw_rectangle(ROI_LEFT, CONTROL_BAND_TOP,
+                               ROI_RIGHT - ROI_LEFT,
+                               CONTROL_BAND_BOTTOM - CONTROL_BAND_TOP,
+                               color=(0, 255, 0), thickness=1)
+            img.draw_rectangle(ROI_LEFT, LOOKAHEAD_BAND_TOP,
+                               ROI_RIGHT - ROI_LEFT,
+                               LOOKAHEAD_BAND_BOTTOM - LOOKAHEAD_BAND_TOP,
+                               color=(255, 128, 0), thickness=1)
 
             state_name = VisionState.name(geom.vision_state)
             mode_name = {
