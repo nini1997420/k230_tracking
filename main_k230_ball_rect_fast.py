@@ -28,7 +28,7 @@ from media.display import *
 from media.media import *
 
 
-BUILD_ID = "K230_BALL_RECT_LOCAL_TRACK_20260729_05"
+BUILD_ID = "K230_BALL_RECT_LOCAL_TRACK_20260729_06"
 
 # ---------------------------------------------------------------------------
 # 摄像头
@@ -128,6 +128,13 @@ def ticks_diff(now_ms, old_ms):
         return time.ticks_diff(now_ms, old_ms)
     except Exception:
         return int(now_ms) - int(old_ms)
+
+
+def ticks_add(base_ms, delta_ms):
+    try:
+        return time.ticks_add(base_ms, delta_ms)
+    except Exception:
+        return int(base_ms) + int(delta_ms)
 
 
 def write_le16(buffer, offset, value):
@@ -605,7 +612,7 @@ def main():
     fps = 0.0
     fps_start_ms = 0
     fps_start_frames = 0
-    last_send_ms = 0
+    next_send_ms = 0
 
     try:
         print("=" * 64)
@@ -687,7 +694,10 @@ def main():
         print("[RUN] main loop")
 
         fps_start_ms = time.ticks_ms()
-        last_send_ms = fps_start_ms
+        next_send_ms = ticks_add(
+            fps_start_ms,
+            UART_SEND_INTERVAL_MS,
+        )
 
         while True:
             os.exitpoint()
@@ -702,9 +712,20 @@ def main():
             ball = ball_tracker.detect(image, pipe)
             now_ms = time.ticks_ms()
 
-            if ticks_diff(now_ms, last_send_ms) >= UART_SEND_INTERVAL_MS:
+            if ticks_diff(now_ms, next_send_ms) >= 0:
                 uart.send(packet_builder.build(pipe.valid, ball))
-                last_send_ms = now_ms
+                next_send_ms = ticks_add(
+                    next_send_ms,
+                    UART_SEND_INTERVAL_MS,
+                )
+
+                # 如果主循环偶尔卡顿，只跳过已错过的发送时刻。
+                # 不连续补发旧坐标，下一包仍保持在固定 20 ms 时间轴上。
+                while ticks_diff(now_ms, next_send_ms) >= 0:
+                    next_send_ms = ticks_add(
+                        next_send_ms,
+                        UART_SEND_INTERVAL_MS,
+                    )
 
             elapsed = ticks_diff(now_ms, fps_start_ms)
             if elapsed >= 1000:
