@@ -28,7 +28,7 @@ from media.display import *
 from media.media import *
 
 
-BUILD_ID = "K230_BALL_RECT_LOCAL_TRACK_20260729_06"
+BUILD_ID = "K230_BALL_RECT_LOCAL_TRACK_20260729_07"
 
 # ---------------------------------------------------------------------------
 # 摄像头
@@ -119,8 +119,14 @@ UART_RX_PIN = 33
 UART_ID = 3
 UART_BAUD = 460800
 UART_SEND_INTERVAL_MS = 20
+ENABLE_TERMINAL_LOG = False
 
 GC_INTERVAL_FRAMES = 300
+
+
+def terminal_print(*args):
+    if ENABLE_TERMINAL_LOG:
+        print(*args)
 
 
 def ticks_diff(now_ms, old_ms):
@@ -221,7 +227,7 @@ class PipeRectTracker:
             )
         except Exception as error:
             self.rect.reason = "PIPE_API"
-            print("[PIPE] find_blobs error:", repr(error))
+            terminal_print("[PIPE] find_blobs error:", repr(error))
             return self.rect
 
         best = None
@@ -375,7 +381,7 @@ class FastBallTracker:
             )
         except Exception as error:
             result.reason = "BALL_API"
-            print("[BALL] find_blobs error:", repr(error))
+            terminal_print("[BALL] find_blobs error:", repr(error))
             return result
 
         best = None
@@ -528,7 +534,7 @@ class UARTLink:
     def __init__(self):
         self.uart = None
         if not ENABLE_UART:
-            print("[UART] disabled")
+            terminal_print("[UART] disabled")
             return
         fpioa = FPIOA()
         fpioa.set_function(
@@ -549,7 +555,7 @@ class UARTLink:
             )
         except TypeError:
             self.uart = UART(uart_id, baudrate=UART_BAUD)
-        print(
+        terminal_print(
             "[UART] GPIO%d/%d UART3 @ %d"
             % (UART_TX_PIN, UART_RX_PIN, UART_BAUD)
         )
@@ -615,11 +621,11 @@ def main():
     next_send_ms = 0
 
     try:
-        print("=" * 64)
-        print("BUILD:", BUILD_ID)
-        print("MODE: LOW-RATE PIPE RECT + LOCAL BALL ROI")
-        print("DISPLAY:", 1 if ENABLE_DISPLAY else 0)
-        print("=" * 64)
+        terminal_print("=" * 64)
+        terminal_print("BUILD:", BUILD_ID)
+        terminal_print("MODE: LOW-RATE PIPE RECT + LOCAL BALL ROI")
+        terminal_print("DISPLAY:", 1 if ENABLE_DISPLAY else 0)
+        terminal_print("=" * 64)
 
         uart = UARTLink()
         sensor = Sensor(
@@ -649,7 +655,7 @@ def main():
                 quality=35,
             )
             display_ok = True
-            print("[DISPLAY] ST7701 ready")
+            terminal_print("[DISPLAY] ST7701 ready")
 
         MediaManager.init()
         media_initialized = True
@@ -674,7 +680,7 @@ def main():
             ball_tracker.set_threshold(
                 pipe_uq - BALL_DARK_OFFSET_FROM_PIPE_UQ
             )
-            print(
+            terminal_print(
                 "[CAL] pipe_uq=%d pipe_T=%d ball_T=%d"
                 % (
                     pipe_uq,
@@ -683,15 +689,15 @@ def main():
                 )
             )
         except Exception as error:
-            print("[CAL] defaults used:", repr(error))
+            terminal_print("[CAL] defaults used:", repr(error))
 
         # 使用更新后的阈值再精确锁定一次。
         pipe = pipe_tracker.update(image, force=True)
-        print(
+        terminal_print(
             "[PIPE] lock x=%d y=%d w=%d h=%d"
             % (pipe.x(), pipe.y(), pipe.w(), pipe.h())
         )
-        print("[RUN] main loop")
+        terminal_print("[RUN] main loop")
 
         fps_start_ms = time.ticks_ms()
         next_send_ms = ticks_add(
@@ -727,19 +733,20 @@ def main():
                         UART_SEND_INTERVAL_MS,
                     )
 
-            elapsed = ticks_diff(now_ms, fps_start_ms)
-            if elapsed >= 1000:
-                frames = frame_count - fps_start_frames
-                fps = frames * 1000.0 / float(max(1, elapsed))
-                fps_start_ms = now_ms
-                fps_start_frames = frame_count
+            if ENABLE_TERMINAL_LOG:
+                elapsed = ticks_diff(now_ms, fps_start_ms)
+                if elapsed >= 1000:
+                    frames = frame_count - fps_start_frames
+                    fps = frames * 1000.0 / float(max(1, elapsed))
+                    fps_start_ms = now_ms
+                    fps_start_frames = frame_count
 
             if display_ok and frame_count % DISPLAY_EVERY_N == 0:
                 draw_debug(image, pipe, ball)
                 Display.show_image(image, x=0, y=0)
 
-            if frame_count % 120 == 0:
-                print(
+            if ENABLE_TERMINAL_LOG and frame_count % 120 == 0:
+                terminal_print(
                     "[PIPE] x=%d y=%d w=%d h=%d fresh=%d %s"
                     % (
                         pipe.x(),
@@ -751,7 +758,7 @@ def main():
                     )
                 )
                 if ball.valid:
-                    print(
+                    terminal_print(
                         "[BALL] x=%.1f pos=%.2fcm %s w=%d h=%d fps=%.1f"
                         % (
                             ball.x,
@@ -763,7 +770,7 @@ def main():
                         )
                     )
                 else:
-                    print(
+                    terminal_print(
                         "[BALL] LOST %s fps=%.1f"
                         % (ball.reason, fps)
                     )
@@ -772,15 +779,16 @@ def main():
                 gc.collect()
 
     except KeyboardInterrupt:
-        print("[STOP] user interrupted")
+        terminal_print("[STOP] user interrupted")
     except BaseException as error:
-        print("[FATAL]", repr(error))
-        try:
-            sys.print_exception(error)
-        except Exception:
-            pass
+        terminal_print("[FATAL]", repr(error))
+        if ENABLE_TERMINAL_LOG:
+            try:
+                sys.print_exception(error)
+            except Exception:
+                pass
     finally:
-        print("[CLEANUP] start")
+        terminal_print("[CLEANUP] start")
         try:
             if uart is not None:
                 uart.send(packet_builder.build(False, BallResult()))
@@ -808,7 +816,7 @@ def main():
                 pass
         if uart is not None:
             uart.deinit()
-        print("[CLEANUP] done")
+        terminal_print("[CLEANUP] done")
 
 
 if __name__ == "__main__":
