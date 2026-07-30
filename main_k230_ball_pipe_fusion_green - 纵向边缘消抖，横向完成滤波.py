@@ -9,7 +9,7 @@ K230 车载平衡滚球 - 管道矩形 + 局部球跟踪高速版
     -> UART
 
 低频路径：
-    每 10 帧在RGB565通道中分割绿色内壁并缓存管道矩形。
+    每 8 帧在限定搜索区内找一次白色长矩形并缓存。
 
 丢球路径：
     先扩大局部 ROI；连续丢失后每 2 帧在缓存的管道矩形内重捕获。
@@ -28,7 +28,7 @@ from media.display import *
 from media.media import *
 
 
-BUILD_ID = "K230_BALL_PIPE_FUSION_GREEN_20260731_28"
+BUILD_ID = "K230_BALL_PIPE_FUSION_GREEN_20260730_19"
 
 # ---------------------------------------------------------------------------
 # 摄像头
@@ -50,7 +50,7 @@ SENSOR_HMIRROR = False
 SENSOR_VFLIP = False
 
 # ---------------------------------------------------------------------------
-# 管道矩形：RGB565绿色内壁锁定
+# 管道矩形：动态白色长矩形锁定
 # ---------------------------------------------------------------------------
 
 PIPE_LENGTH_CM = 25.0
@@ -61,117 +61,80 @@ PIPE_INITIAL_RIGHT = 612       # exclusive
 PIPE_INITIAL_TOP = 252
 PIPE_INITIAL_BOTTOM = 295      # exclusive
 
-# 只在该范围搜索绿色管道内壁。
+# 只在该范围搜索白色管道。
 PIPE_SEARCH_X = 15
 PIPE_SEARCH_Y = 152
 PIPE_SEARCH_W = 610
 PIPE_SEARCH_H = 255
 
-PIPE_UPDATE_EVERY_N = 10
-# LAB阈值覆盖照片中绿色内壁，同时排除红色底板和蓝色背景。
-# K230 RGB565 find_blobs的LAB范围：L=0~100，A/B=-128~127。
-PIPE_GREEN_LAB = (35, 95, -60, -8, -25, 55)
-PIPE_GREEN_END_PAD = 2
-PIPE_GREEN_SIDE_PAD = 0
+PIPE_UPDATE_EVERY_N = 8
+PIPE_WHITE_THRESHOLD_DEFAULT = 150
+PIPE_WHITE_THRESHOLD_MIN = 140
+PIPE_WHITE_THRESHOLD_MAX = 205
+PIPE_WHITE_OFFSET_FROM_UQ = 55
 PIPE_MIN_WIDTH = 360
 PIPE_MAX_WIDTH = 625
-PIPE_MIN_HEIGHT = 10
-PIPE_MAX_HEIGHT = 120
+PIPE_MIN_HEIGHT = 16
+PIPE_MAX_HEIGHT = 175
 PIPE_MIN_PIXELS = 1200
+PIPE_SMOOTH_ALPHA = 0.60
 
-# 左右端点完全来自绿色内壁，只做对称的时域滤波，不限制变化方向。
-PIPE_ENDPOINT_ALPHA = 0.45
-PIPE_ENDPOINT_MAX_STEP = 12.0
-PIPE_ENDPOINT_DEADBAND = 1.5
+# 管道物理长度不会在相邻两次更新间突然缩短。
+# 底板遮挡或粘连造成某一端向内跳变时，保留该端上一次可信坐标。
+PIPE_ENDPOINT_MIN_TRUSTED_SPAN = 500
+PIPE_ENDPOINT_MAX_INWARD_ERROR = 28
+PIPE_ENDPOINT_MAX_STEP = 10.0
 
-# 短轴上下边界来自绿色内壁并向外扩到白边，分别限速低通。
+# 长度方向仍由白色长矩形动态给出；横向只接受“没有被底板拉宽”的可信测量。
+# 当前安装的可靠初值为 y=252~295。正常管道厚度约40~50像素，
+# 因此检测框一旦高于72像素，就只更新左右端点，不允许它拉偏横向中心。
+PIPE_TRANSVERSE_HALF_HEIGHT = 32
 PIPE_TRANSVERSE_TRUST_MAX_HEIGHT = 72
-PIPE_TRANSVERSE_OUTPUT_MAX_HEIGHT = 56
 PIPE_TRANSVERSE_CENTER_MIN = 232
 PIPE_TRANSVERSE_CENTER_MAX = 317
 PIPE_TRANSVERSE_TRUST_MAX_CENTER_ERROR = 20
-PIPE_TRANSVERSE_ALPHA = 0.35
-PIPE_TRANSVERSE_MAX_STEP = 4.0
-PIPE_TRANSVERSE_DEADBAND = 1.5
+PIPE_TRANSVERSE_MAX_STEP = 6.0
 
 # 连续若干次管道更新失败时继续短时使用缓存矩形；
 # 超过该次数后清除pipe_valid，避免长期发送错误位置。
 PIPE_MAX_STALE_UPDATES = 6
 
 # ---------------------------------------------------------------------------
-# 钢球：绿色内槽中的局部灰度检测
+# 钢球：完整保留精准版本的识别参数
 # ---------------------------------------------------------------------------
 
-BALL_THRESHOLD_DEFAULT = 105
-BALL_THRESHOLD_MIN = 45
-BALL_THRESHOLD_MAX = 155
-BALL_DARK_OFFSET_FROM_PIPE_MEDIAN = 22
-BALL_BRIGHT_OFFSET_FROM_PIPE_MEDIAN = 30
-BALL_BRIGHT_THRESHOLD_MIN = 120
-BALL_BRIGHT_THRESHOLD_MAX = 245
-BALL_THRESHOLD_ADAPT_ALPHA = 0.35
-BALL_THRESHOLD_UPDATE_EVERY_N = 4
+BALL_THRESHOLD_DEFAULT = 125
+BALL_THRESHOLD_MIN = 80
+BALL_THRESHOLD_MAX = 145
+BALL_DARK_OFFSET_FROM_PIPE_MEDIAN = 25
 
 BALL_MIN_W = 3
 BALL_MIN_H = 3
 BALL_MAX_W = 48
 BALL_MAX_H = 48
-BALL_MIN_ASPECT = 0.45
-BALL_MAX_ASPECT = 2.20
+BALL_MIN_ASPECT = 0.36
+BALL_MAX_ASPECT = 2.75
 BALL_MIN_DENSITY = 0.16
 
 # 锁定后只扫描小矩形。丢失1~2帧时扩大一次。
-BALL_LOCAL_HALF_W = 40
+BALL_LOCAL_HALF_W = 52
 BALL_LOCAL_HALF_H = 36
-BALL_EXPANDED_HALF_W = 80
+BALL_EXPANDED_HALF_W = 105
 BALL_EXPANDED_HALF_H = 62
 BALL_GLOBAL_AFTER_MISSES = 2
 BALL_GLOBAL_EVERY_N = 1
 # 根因是暗色背景与钢球被错误合并，不是阈值不足。
 # 全局与局部均使用同一个标定阈值，避免高阈值把球粘到管内阴影。
-BALL_GLOBAL_THRESHOLD_STEPS = (-8, 0, 8)
+BALL_GLOBAL_THRESHOLD_STEPS = (0,)
 BALL_GLOBAL_THRESHOLD_CAP = BALL_THRESHOLD_MAX
 BALL_SMOOTH_ALPHA = 0.76
-BALL_REACQUIRE_ALPHA = 0.35
-BALL_LOCAL_MAX_JUMP = 22.0
-BALL_EXPANDED_MAX_JUMP = 55.0
-BALL_DISTANCE_SCORE_PENALTY = 1.25
-BALL_SIZE_SCORE_PENALTY = 1.5
-BALL_OUTPUT_MAX_STEP_X = 20.0
-BALL_OUTPUT_MAX_STEP_Y = 6.0
-BALL_POSITION_ALPHA = 0.65
-BALL_POSITION_MAX_STEP_RATIO = 0.032
 BALL_PIPE_RECT_PAD = 5
-BALL_HOLD_MISSES = 2
+BALL_HOLD_MISSES = 1
 # 钢球只在管道内槽中心搜索。当前管道外框约65像素宽，
 # 中心40像素足以覆盖钢球，同时排除两侧底板孔、线缆和金属反光。
-BALL_PIPE_CENTER_HALF_H = 14
-BALL_CENTER_MAX_OFFSET = 11
+BALL_PIPE_CENTER_HALF_H = 20
+BALL_CENTER_MAX_OFFSET = 18
 BALL_CENTER_OFFSET_SCORE_PENALTY = 1.5
-BALL_ENDPOINT_GUARD = 10
-
-# 金属球必须同时具有暗部和高光；普通绿色阴影不满足该条件。
-BALL_SIGNATURE_PAD = 4
-BALL_MIN_LOCAL_RANGE = 45.0
-BALL_MIN_HIGHLIGHT_DELTA = 22.0
-BALL_MIN_LOCAL_STDEV = 11.0
-
-# 暗blob只负责提供小ROI，最终坐标必须来自完整圆轮廓。
-# 初始半径范围按管道短轴比例生成；锁定后再由历史圆半径自适应收窄。
-BALL_CIRCLE_THRESHOLD = 650
-BALL_CIRCLE_ROI_MIN_HALF = 16
-BALL_CIRCLE_ROI_MAX_HALF = 30
-BALL_CIRCLE_ROI_EXTRA = 9
-BALL_CIRCLE_MIN_RADIUS_RATIO = 0.10
-BALL_CIRCLE_MAX_RADIUS_RATIO = 0.32
-BALL_CIRCLE_TRACK_RADIUS_TOLERANCE = 0.35
-BALL_CIRCLE_MAX_CENTER_Y_RATIO = 0.24
-BALL_CIRCLE_MAX_COARSE_DISTANCE_RATIO = 1.60
-BALL_CIRCLE_RADIUS_ALPHA = 0.30
-BALL_CIRCLE_DISTANCE_PENALTY = 30.0
-BALL_CIRCLE_RADIUS_PENALTY = 45.0
-BALL_REACQUIRE_CONFIRM_FRAMES = 2
-BALL_CONFIRM_MAX_DISTANCE = 16.0
 
 # ---------------------------------------------------------------------------
 # 显示与UART
@@ -180,7 +143,6 @@ BALL_CONFIRM_MAX_DISTANCE = 16.0
 ENABLE_DISPLAY = True
 DISPLAY_TO_IDE = False
 DISPLAY_EVERY_N = 10
-DISPLAY_SHOW_LOST_REASON = True
 
 ENABLE_UART = True
 UART_TX_PIN = 32
@@ -269,39 +231,32 @@ class BallResult:
 class PipeRectTracker:
     def __init__(self):
         self.rect = PipeRect()
+        self.white_threshold = PIPE_WHITE_THRESHOLD_DEFAULT
         self.misses = 0
 
-    @staticmethod
-    def _filter_endpoint(old_value, measured_value, force):
-        if force:
-            return measured_value
-        delta = measured_value - old_value
-        if abs(delta) <= PIPE_ENDPOINT_DEADBAND:
-            return old_value
-        step = delta * PIPE_ENDPOINT_ALPHA
-        step = max(
-            -PIPE_ENDPOINT_MAX_STEP,
-            min(PIPE_ENDPOINT_MAX_STEP, step),
+    def set_threshold(self, value):
+        self.white_threshold = max(
+            PIPE_WHITE_THRESHOLD_MIN,
+            min(PIPE_WHITE_THRESHOLD_MAX, int(value)),
         )
-        return old_value + step
 
     def update(self, image, force=False):
         self.rect.fresh = False
         try:
             blobs = image.find_blobs(
-                [PIPE_GREEN_LAB],
+                [(self.white_threshold, 255)],
                 roi=(
                     PIPE_SEARCH_X,
                     PIPE_SEARCH_Y,
                     PIPE_SEARCH_W,
                     PIPE_SEARCH_H,
                 ),
-                x_stride=4,
-                y_stride=2,
-                area_threshold=600,
+                x_stride=8,
+                y_stride=4,
+                area_threshold=900,
                 pixels_threshold=PIPE_MIN_PIXELS,
                 merge=True,
-                margin=2,
+                margin=4,
             )
         except Exception as error:
             self.misses += 1
@@ -327,31 +282,19 @@ class PipeRectTracker:
             cx = float(blob.x()) + (width - 1) * 0.5
             old_cx = (self.rect.left + self.rect.right - 1.0) * 0.5
 
-            # 绿色像素越多、长度越大、与当前中心越接近越优先。
+            # 采用本次提供代码的长白矩形评分：
+            # 白色像素越多、长度越大、与历史中心越接近越优先。
             score = float(pixels) + width * 4.0 - abs(cx - old_cx)
             if score > best_score:
                 best_score = score
                 best = (
-                    float(max(0, blob.x() - PIPE_GREEN_END_PAD)),
-                    float(
-                        min(
-                            DETECT_WIDTH,
-                            blob.x() + width + PIPE_GREEN_END_PAD,
-                        )
-                    ),
-                    float(max(0, blob.y() - PIPE_GREEN_SIDE_PAD)),
-                    float(
-                        min(
-                            DETECT_HEIGHT,
-                            blob.y() + height + PIPE_GREEN_SIDE_PAD,
-                        )
-                    ),
+                    float(blob.x()),
+                    float(blob.x() + width),
+                    float(blob.y()),
+                    float(blob.y() + height),
                 )
 
         if best is None:
-            self.pending_x = None
-            self.pending_y = None
-            self.pending_count = 0
             self.misses += 1
             self.rect.valid = self.misses <= PIPE_MAX_STALE_UPDATES
             self.rect.reason = "PIPE_NOT_FOUND"
@@ -359,22 +302,45 @@ class PipeRectTracker:
 
         self.misses = 0
         left, right, top, bottom = best
+        alpha = 1.0 if force else PIPE_SMOOTH_ALPHA
 
-        # 绿色内壁已经能与底板分离，两个端点直接跟随实测值。
-        # 左右端使用完全对称的死区、低通和最大步长，不再依赖历史长度。
-        self.rect.left = self._filter_endpoint(
-            self.rect.left,
-            left,
-            force,
-        )
-        self.rect.right = self._filter_endpoint(
-            self.rect.right,
-            right,
-            force,
-        )
+        old_left = self.rect.left
+        old_right = self.rect.right
+        measured_span = right - left
 
-        # 绿色内壁与红/蓝底板在LAB中分离。短轴边界分别做低通、死区
-        # 和最大步长限制，既跟随倾斜，又不把单帧颜色缺口变成框抖动。
+        # 分别判断两个端口。检测端点突然向管道内部缩进，说明该端被
+        # 底板/线缆截断，只保留上一帧；正常变化则限速更新，避免跳变。
+        if (
+            measured_span >= PIPE_ENDPOINT_MIN_TRUSTED_SPAN
+            and left <= old_left + PIPE_ENDPOINT_MAX_INWARD_ERROR
+        ):
+            left_delta = left - old_left
+            left_delta = max(
+                -PIPE_ENDPOINT_MAX_STEP,
+                min(PIPE_ENDPOINT_MAX_STEP, left_delta),
+            )
+            target_left = old_left + left_delta
+            self.rect.left = (
+                alpha * target_left + (1.0 - alpha) * old_left
+            )
+
+        if (
+            measured_span >= PIPE_ENDPOINT_MIN_TRUSTED_SPAN
+            and right >= old_right - PIPE_ENDPOINT_MAX_INWARD_ERROR
+        ):
+            right_delta = right - old_right
+            right_delta = max(
+                -PIPE_ENDPOINT_MAX_STEP,
+                min(PIPE_ENDPOINT_MAX_STEP, right_delta),
+            )
+            target_right = old_right + right_delta
+            self.rect.right = (
+                alpha * target_right + (1.0 - alpha) * old_right
+            )
+
+        # 不能直接采用合并blob的top/bottom：车体底板与管道灰度接近时，
+        # merge=True会把它们连成很高的区域，导致矩形横向中心被拉偏，
+        # 随后的钢球中心带也会一起偏离真实管道。
         old_center_y = (self.rect.top + self.rect.bottom - 1.0) * 0.5
         measured_height = bottom - top
         transverse_trusted = False
@@ -384,46 +350,26 @@ class PipeRectTracker:
                 PIPE_TRANSVERSE_CENTER_MIN,
                 min(PIPE_TRANSVERSE_CENTER_MAX, measured_center_y),
             )
-            if force or (
+            if (
                 abs(measured_center_y - old_center_y)
                 <= PIPE_TRANSVERSE_TRUST_MAX_CENTER_ERROR
             ):
+                center_delta = measured_center_y - old_center_y
+                center_delta = max(
+                    -PIPE_TRANSVERSE_MAX_STEP,
+                    min(PIPE_TRANSVERSE_MAX_STEP, center_delta),
+                )
+                target_center_y = old_center_y + center_delta
                 transverse_trusted = True
 
-        if transverse_trusted:
-            output_height = min(
-                measured_height,
-                PIPE_TRANSVERSE_OUTPUT_MAX_HEIGHT,
-            )
-            target_top = measured_center_y - (output_height - 1.0) * 0.5
-            target_bottom = target_top + output_height
+        if not transverse_trusted:
+            # 异常宽框或中心跳变框只贡献左右端点，横向中心保持可信值。
+            target_center_y = old_center_y
 
-            if force:
-                self.rect.top = target_top
-                self.rect.bottom = target_bottom
-            else:
-                top_delta = target_top - self.rect.top
-                bottom_delta = target_bottom - self.rect.bottom
-                if abs(top_delta) <= PIPE_TRANSVERSE_DEADBAND:
-                    top_delta = 0.0
-                if abs(bottom_delta) <= PIPE_TRANSVERSE_DEADBAND:
-                    bottom_delta = 0.0
-                top_step = max(
-                    -PIPE_TRANSVERSE_MAX_STEP,
-                    min(
-                        PIPE_TRANSVERSE_MAX_STEP,
-                        top_delta * PIPE_TRANSVERSE_ALPHA,
-                    ),
-                )
-                bottom_step = max(
-                    -PIPE_TRANSVERSE_MAX_STEP,
-                    min(
-                        PIPE_TRANSVERSE_MAX_STEP,
-                        bottom_delta * PIPE_TRANSVERSE_ALPHA,
-                    ),
-                )
-                self.rect.top += top_step
-                self.rect.bottom += bottom_step
+        target_top = target_center_y - PIPE_TRANSVERSE_HALF_HEIGHT
+        target_bottom = target_center_y + PIPE_TRANSVERSE_HALF_HEIGHT + 1.0
+        self.rect.top = target_top
+        self.rect.bottom = target_bottom
         self.rect.valid = True
         self.rect.fresh = True
         if transverse_trusted:
@@ -436,72 +382,19 @@ class PipeRectTracker:
 class FastBallTracker:
     def __init__(self):
         self.gray_threshold = BALL_THRESHOLD_DEFAULT
-        self.bright_threshold = BALL_BRIGHT_THRESHOLD_MIN
         self.filtered_x = None
         self.filtered_y = None
-        self.filtered_ratio = None
         self.last_x = None
         self.last_y = None
         self.last_rect = None
-        self.circle_radius = None
-        self.pending_x = None
-        self.pending_y = None
-        self.pending_count = 0
         self.misses = BALL_GLOBAL_AFTER_MISSES
         self.frame_index = 0
 
-    def set_pipe_median(self, value):
-        pipe_median = int(value)
+    def set_threshold(self, value):
         self.gray_threshold = max(
             BALL_THRESHOLD_MIN,
-            min(
-                BALL_THRESHOLD_MAX,
-                pipe_median - BALL_DARK_OFFSET_FROM_PIPE_MEDIAN,
-            ),
+            min(BALL_THRESHOLD_MAX, int(value)),
         )
-        self.bright_threshold = max(
-            BALL_BRIGHT_THRESHOLD_MIN,
-            min(
-                BALL_BRIGHT_THRESHOLD_MAX,
-                pipe_median + BALL_BRIGHT_OFFSET_FROM_PIPE_MEDIAN,
-            ),
-        )
-
-    def _update_local_threshold(self, image, roi):
-        try:
-            stats = image.get_statistics(roi=roi)
-            pipe_median = int(stats.median())
-            dark_target = max(
-                BALL_THRESHOLD_MIN,
-                min(
-                    BALL_THRESHOLD_MAX,
-                    pipe_median - BALL_DARK_OFFSET_FROM_PIPE_MEDIAN,
-                ),
-            )
-            bright_target = max(
-                BALL_BRIGHT_THRESHOLD_MIN,
-                min(
-                    BALL_BRIGHT_THRESHOLD_MAX,
-                    pipe_median + BALL_BRIGHT_OFFSET_FROM_PIPE_MEDIAN,
-                ),
-            )
-            self.gray_threshold = int(
-                round(
-                    BALL_THRESHOLD_ADAPT_ALPHA * dark_target
-                    + (1.0 - BALL_THRESHOLD_ADAPT_ALPHA)
-                    * self.gray_threshold
-                )
-            )
-            self.bright_threshold = int(
-                round(
-                    BALL_THRESHOLD_ADAPT_ALPHA * bright_target
-                    + (1.0 - BALL_THRESHOLD_ADAPT_ALPHA)
-                    * self.bright_threshold
-                )
-            )
-        except Exception:
-            # 保留上一帧阈值；检测链路继续运行。
-            pass
 
     def _clip_roi(self, x0, y0, x1, y1, pipe):
         # 长度方向跟随动态端点；宽度方向仅保留管道中心带。
@@ -569,154 +462,6 @@ class FastBallTracker:
             1,
         )
 
-    def _candidate_signature(
-        self,
-        image,
-        pipe,
-        center_x,
-        center_y,
-        blob_width,
-        blob_height,
-    ):
-        half_w = max(6, blob_width // 2 + BALL_SIGNATURE_PAD)
-        half_h = max(6, blob_height // 2 + BALL_SIGNATURE_PAD)
-        roi = self._clip_roi(
-            center_x - half_w,
-            center_y - half_h,
-            center_x + half_w + 1,
-            center_y + half_h + 1,
-            pipe,
-        )
-        if roi is None:
-            return None
-        try:
-            stats = image.get_statistics(roi=roi)
-            minimum = float(stats.min())
-            maximum = float(stats.max())
-            median = float(stats.median())
-            stdev = float(stats.stdev())
-        except Exception:
-            return None
-
-        local_range = maximum - minimum
-        highlight_delta = maximum - median
-        if (
-            local_range < BALL_MIN_LOCAL_RANGE
-            or highlight_delta < BALL_MIN_HIGHLIGHT_DELTA
-            or stdev < BALL_MIN_LOCAL_STDEV
-        ):
-            return None
-        return local_range, highlight_delta, stdev
-
-    def _refine_center(
-        self,
-        image,
-        pipe,
-        coarse_x,
-        coarse_y,
-        blob_width,
-        blob_height,
-    ):
-        pipe_height = float(max(1, pipe.h()))
-        pipe_center_y = pipe.y() + (pipe.h() - 1) * 0.5
-
-        if self.circle_radius is None:
-            min_radius = max(
-                3,
-                int(round(pipe_height * BALL_CIRCLE_MIN_RADIUS_RATIO)),
-            )
-            max_radius = max(
-                min_radius + 2,
-                int(round(pipe_height * BALL_CIRCLE_MAX_RADIUS_RATIO)),
-            )
-            expected_radius = (min_radius + max_radius) * 0.5
-        else:
-            expected_radius = self.circle_radius
-            tolerance = max(
-                2.0,
-                expected_radius * BALL_CIRCLE_TRACK_RADIUS_TOLERANCE,
-            )
-            min_radius = max(3, int(round(expected_radius - tolerance)))
-            max_radius = max(
-                min_radius + 2,
-                int(round(expected_radius + tolerance)),
-            )
-        max_radius = min(
-            max_radius,
-            max(min_radius + 2, BALL_PIPE_CENTER_HALF_H - 1),
-        )
-        expected_radius = max(
-            float(min_radius),
-            min(float(max_radius), expected_radius),
-        )
-
-        half = max(
-            BALL_CIRCLE_ROI_MIN_HALF,
-            max(blob_width, blob_height) + BALL_CIRCLE_ROI_EXTRA,
-            int(round(max_radius * 1.7)),
-        )
-        half = min(BALL_CIRCLE_ROI_MAX_HALF, half)
-        circle_roi = self._clip_roi(
-            coarse_x - half,
-            coarse_y - half,
-            coarse_x + half + 1,
-            coarse_y + half + 1,
-            pipe,
-        )
-        if circle_roi is None:
-            return None
-
-        try:
-            circles = image.find_circles(
-                roi=circle_roi,
-                x_stride=1,
-                y_stride=1,
-                threshold=BALL_CIRCLE_THRESHOLD,
-                x_margin=3,
-                y_margin=3,
-                r_margin=3,
-            )
-        except Exception:
-            return None
-
-        max_center_y_error = max(
-            4.0,
-            pipe_height * BALL_CIRCLE_MAX_CENTER_Y_RATIO,
-        )
-        max_coarse_distance = max(
-            8.0,
-            expected_radius * BALL_CIRCLE_MAX_COARSE_DISTANCE_RATIO,
-        )
-        best_circle = None
-        best_score = -1.0e30
-        for circle in circles:
-            radius = float(circle.r())
-            if radius < min_radius or radius > max_radius:
-                continue
-            center_x = float(circle.x())
-            center_y = float(circle.y())
-            if abs(center_y - pipe_center_y) > max_center_y_error:
-                continue
-            coarse_distance = (
-                abs(center_x - coarse_x) + abs(center_y - coarse_y)
-            )
-            if coarse_distance > max_coarse_distance:
-                continue
-            try:
-                magnitude = float(circle.magnitude())
-            except Exception:
-                magnitude = 0.0
-            score = (
-                magnitude
-                - coarse_distance * BALL_CIRCLE_DISTANCE_PENALTY
-                - abs(radius - expected_radius)
-                * BALL_CIRCLE_RADIUS_PENALTY
-            )
-            if score > best_score:
-                best_score = score
-                best_circle = (center_x, center_y, radius)
-        return best_circle
-
     def detect(self, image, pipe):
         result = BallResult()
         roi, mode, x_stride, y_stride = self._choose_roi(pipe)
@@ -725,33 +470,20 @@ class FastBallTracker:
             result.reason = mode
             return result
 
-        # 绿色内壁灰度会随曝光和倾角变化，使用当前小ROI的中位数
-        # 更新暗球阈值。
-        if (
-            mode == "GLOBAL"
-            or self.frame_index % BALL_THRESHOLD_UPDATE_EVERY_N == 0
-        ):
-            self._update_local_threshold(image, roi)
         search_threshold = self.gray_threshold
         if mode == "GLOBAL":
             step_index = self.frame_index % len(
                 BALL_GLOBAL_THRESHOLD_STEPS
             )
-            search_threshold = max(
-                BALL_THRESHOLD_MIN,
-                min(
-                    BALL_GLOBAL_THRESHOLD_CAP,
-                    self.gray_threshold
-                    + BALL_GLOBAL_THRESHOLD_STEPS[step_index],
-                ),
+            search_threshold = min(
+                BALL_GLOBAL_THRESHOLD_CAP,
+                self.gray_threshold
+                + BALL_GLOBAL_THRESHOLD_STEPS[step_index],
             )
 
         try:
             blobs = image.find_blobs(
-                [
-                    (0, search_threshold),
-                    (self.bright_threshold, 255),
-                ],
+                [(0, search_threshold)],
                 roi=roi,
                 x_stride=x_stride,
                 y_stride=y_stride,
@@ -767,9 +499,8 @@ class FastBallTracker:
             terminal_print("[BALL] find_blobs error:", repr(error))
             return result
 
-        candidates = []
-        geometry_candidates = 0
-        signature_candidates = 0
+        best = None
+        best_score = -1.0
         pipe_center_y = pipe.y() + pipe.h() * 0.5
         for blob in blobs:
             width = int(blob.w())
@@ -790,254 +521,85 @@ class FastBallTracker:
 
             cx = float(blob.x()) + (width - 1) * 0.5
             cy = float(blob.y()) + (height - 1) * 0.5
-            if (
-                cx < pipe.left + BALL_ENDPOINT_GUARD
-                or cx > pipe.right - BALL_ENDPOINT_GUARD
-            ):
-                continue
             center_offset = abs(cy - pipe_center_y)
             if center_offset > BALL_CENTER_MAX_OFFSET:
                 continue
-            geometry_candidates += 1
-            signature = self._candidate_signature(
-                image,
-                pipe,
-                cx,
-                cy,
-                width,
-                height,
-            )
-            if signature is None:
-                continue
-            signature_candidates += 1
-            local_range, highlight_delta, local_stdev = signature
             pixels = int(blob.pixels())
             roundness = min(width, height) / float(max(width, height))
             score = float(pixels) * (0.50 + 0.50 * roundness)
             score *= 0.72 + 0.28 * density
             score -= center_offset * BALL_CENTER_OFFSET_SCORE_PENALTY
-            score += (
-                local_range * 0.35
-                + highlight_delta * 0.55
-                + local_stdev * 1.20
-            )
-            if self.filtered_x is not None:
-                distance = (
-                    abs(cx - self.filtered_x)
-                    + abs(cy - self.filtered_y)
-                )
-                if mode == "LOCAL" and distance > BALL_LOCAL_MAX_JUMP:
-                    continue
-                if (
-                    mode == "EXPAND"
-                    and distance > BALL_EXPANDED_MAX_JUMP
-                ):
-                    continue
-                score -= distance * BALL_DISTANCE_SCORE_PENALTY
-            if self.last_rect is not None:
-                size_error = (
-                    abs(width - self.last_rect[2])
-                    + abs(height - self.last_rect[3])
-                )
-                score -= size_error * BALL_SIZE_SCORE_PENALTY
+            if self.last_x is not None:
+                distance = abs(cx - self.last_x) + abs(cy - self.last_y)
+                score += max(0.0, 14.0 - distance * 0.10)
 
-            candidates.append(
-                (
-                    score,
-                    cx,
-                    cy,
-                    width,
-                    height,
-                    density,
-                    pixels,
-                    local_range,
-                )
-            )
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best = None
-        for candidate in candidates[:2]:
-            (
-                score,
-                coarse_x,
-                coarse_y,
-                width,
-                height,
-                density,
-                pixels,
-                local_range,
-            ) = candidate
-            refined = self._refine_center(
-                image,
-                pipe,
-                coarse_x,
-                coarse_y,
-                width,
-                height,
-            )
-            if refined is None:
-                continue
-            raw_x, raw_y, measured_radius = refined
-            best = (
-                raw_x,
-                raw_y,
-                measured_radius,
-                coarse_x,
-                coarse_y,
-                width,
-                height,
-                density,
-                pixels,
-                local_range,
-            )
-            break
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, width, height, density, pixels)
 
         if best is None:
-            self.pending_x = None
-            self.pending_y = None
-            self.pending_count = 0
             self.misses += 1
             if (
                 self.filtered_x is not None
                 and self.misses <= BALL_HOLD_MISSES
             ):
-                ratio = self.filtered_ratio
-                if ratio is None:
-                    axis_length = max(
-                        1.0, pipe.right - pipe.left - 1.0
-                    )
-                    ratio = (self.filtered_x - pipe.left) / axis_length
-                    ratio = max(0.0, min(1.0, ratio))
+                axis_length = max(
+                    1.0, pipe.right - pipe.left - 1.0
+                )
+                ratio = (self.filtered_x - pipe.left) / axis_length
+                ratio = max(0.0, min(1.0, ratio))
                 result.valid = True
                 result.x = self.filtered_x
                 result.y = self.filtered_y
                 result.position_cm = ratio * PIPE_LENGTH_CM
                 result.confidence = 20
-                result.reason = "HOLD_%d" % self.misses
+                result.reason = "HOLD_1"
                 result.search_mode = "HOLD"
                 result.rect = self.last_rect
                 return result
-            if geometry_candidates == 0:
-                result.reason = "NO_SHAPE"
-            elif signature_candidates == 0:
-                result.reason = "NO_METAL"
-            elif candidates:
-                result.reason = "NO_CIRCLE"
-            else:
-                result.reason = "NO_TRACK"
+            result.reason = "NO_BLOB_%s_T%d" % (
+                mode, search_threshold
+            )
             return result
 
-        (
-            raw_x,
-            raw_y,
-            measured_radius,
-            coarse_x,
-            coarse_y,
+        raw_x, raw_y, width, height, density, pixels = best
+        misses_before_detection = self.misses
+        self.last_x = raw_x
+        self.last_y = raw_y
+        self.misses = 0
+        self.last_rect = (
+            int(round(raw_x - (width - 1) * 0.5)),
+            int(round(raw_y - (height - 1) * 0.5)),
             width,
             height,
-            density,
-            pixels,
-            local_range,
-        ) = best
-        misses_before_detection = self.misses
+        )
 
-        requires_confirmation = (
+        if (
             self.filtered_x is None
             or misses_before_detection >= BALL_GLOBAL_AFTER_MISSES
-        )
-        if requires_confirmation:
-            if (
-                self.pending_x is not None
-                and abs(raw_x - self.pending_x)
-                + abs(raw_y - self.pending_y)
-                <= BALL_CONFIRM_MAX_DISTANCE
-            ):
-                self.pending_count += 1
-                self.pending_x = raw_x
-                self.pending_y = raw_y
-            else:
-                self.pending_x = raw_x
-                self.pending_y = raw_y
-                self.pending_count = 1
-            if self.pending_count < BALL_REACQUIRE_CONFIRM_FRAMES:
-                result.reason = "BALL_CONFIRM"
-                result.search_mode = "CONFIRM"
-                return result
-        self.pending_x = None
-        self.pending_y = None
-        self.pending_count = 0
-
-        self.misses = 0
-        if self.circle_radius is None:
-            self.circle_radius = measured_radius
-        else:
-            self.circle_radius += BALL_CIRCLE_RADIUS_ALPHA * (
-                measured_radius - self.circle_radius
-            )
-        self.last_rect = (
-            int(round(coarse_x - (width - 1) * 0.5)),
-            int(round(coarse_y - (height - 1) * 0.5)),
-            width,
-            height,
-        )
-
-        if self.filtered_x is None:
+        ):
             self.filtered_x = raw_x
             self.filtered_y = raw_y
         else:
-            if misses_before_detection >= BALL_GLOBAL_AFTER_MISSES:
-                alpha = BALL_REACQUIRE_ALPHA
-            else:
-                alpha = BALL_SMOOTH_ALPHA
-            step_x = alpha * (raw_x - self.filtered_x)
-            step_y = alpha * (raw_y - self.filtered_y)
-            step_x = max(
-                -BALL_OUTPUT_MAX_STEP_X,
-                min(BALL_OUTPUT_MAX_STEP_X, step_x),
+            alpha = BALL_SMOOTH_ALPHA
+            self.filtered_x = (
+                alpha * raw_x + (1.0 - alpha) * self.filtered_x
             )
-            step_y = max(
-                -BALL_OUTPUT_MAX_STEP_Y,
-                min(BALL_OUTPUT_MAX_STEP_Y, step_y),
+            self.filtered_y = (
+                alpha * raw_y + (1.0 - alpha) * self.filtered_y
             )
-            self.filtered_x += step_x
-            self.filtered_y += step_y
-
-        # 下一帧局部ROI围绕平滑位置，而不是可能误选的原始blob。
-        self.last_x = self.filtered_x
-        self.last_y = self.filtered_y
 
         axis_length = max(1.0, pipe.right - pipe.left - 1.0)
         ratio = (self.filtered_x - pipe.left) / axis_length
         ratio = max(0.0, min(1.0, ratio))
-        if self.filtered_ratio is None:
-            self.filtered_ratio = ratio
-        else:
-            ratio_step = BALL_POSITION_ALPHA * (
-                ratio - self.filtered_ratio
-            )
-            ratio_step = max(
-                -BALL_POSITION_MAX_STEP_RATIO,
-                min(BALL_POSITION_MAX_STEP_RATIO, ratio_step),
-            )
-            self.filtered_ratio += ratio_step
 
         result.valid = True
         result.x = self.filtered_x
         result.y = self.filtered_y
-        result.position_cm = self.filtered_ratio * PIPE_LENGTH_CM
+        result.position_cm = ratio * PIPE_LENGTH_CM
         result.confidence = max(
             1,
-            min(
-                100,
-                int(
-                    round(
-                        30.0
-                        + 25.0 * density
-                        + pixels * 0.12
-                        + local_range * 0.18
-                    )
-                ),
-            ),
+            min(100, int(round(45.0 + 35.0 * density + pixels * 0.15))),
         )
         result.reason = "OK"
         result.rect = self.last_rect
@@ -1162,12 +724,19 @@ def draw_debug(image, pipe, ball, fps):
     )
 
     if ball.valid:
+        image.draw_circle(
+            int(round(ball.x)),
+            int(round(ball.y)),
+            7,
+            color=ball_color,
+            thickness=3,
+        )
         image.draw_cross(
             int(round(ball.x)),
             int(round(ball.y)),
             color=ball_color,
-            size=4,
-            thickness=1,
+            size=10,
+            thickness=2,
         )
 
     if ball.valid:
@@ -1191,14 +760,6 @@ def draw_debug(image, pipe, ball, fps):
         "FPS:%.1f" % fps,
         color=(0, 255, 255),
     )
-    if DISPLAY_SHOW_LOST_REASON and not ball.valid:
-        image.draw_string_advanced(
-            4,
-            60,
-            16,
-            ball.reason,
-            color=ball_color,
-        )
 
 
 def main():
@@ -1223,7 +784,7 @@ def main():
     try:
         terminal_print("=" * 64)
         terminal_print("BUILD:", BUILD_ID)
-        terminal_print("MODE: GREEN PIPE LAB + ADAPTIVE GRAY BALL")
+        terminal_print("MODE: LOW-RATE PIPE RECT + LOCAL BALL ROI")
         terminal_print("DISPLAY:", 1 if ENABLE_DISPLAY else 0)
         terminal_print("=" * 64)
 
@@ -1282,40 +843,34 @@ def main():
             os.exitpoint()
             image = sensor.snapshot(chn=DETECT_CHANNEL)
 
-        # 管道使用RGB565绿色内壁识别；钢球继续使用灰度通道。
-        color_image = sensor.snapshot(chn=DISPLAY_CHANNEL)
-        pipe = pipe_tracker.update(color_image, force=True)
+        # 启动时先用宽松阈值找管道矩形。
+        pipe = pipe_tracker.update(image, force=True)
         try:
-            pipe_center_y = pipe.y() + pipe.h() // 2
-            ball_cal_top = max(
-                0,
-                pipe_center_y - BALL_PIPE_CENTER_HALF_H,
-            )
-            ball_cal_bottom = min(
-                DETECT_HEIGHT,
-                pipe_center_y + BALL_PIPE_CENTER_HALF_H + 1,
-            )
             stats = image.get_statistics(
-                roi=(
-                    pipe.x(),
-                    ball_cal_top,
-                    pipe.w(),
-                    ball_cal_bottom - ball_cal_top,
-                )
+                roi=(pipe.x(), pipe.y(), pipe.w(), pipe.h())
+            )
+            pipe_uq = int(stats.uq())
+            pipe_tracker.set_threshold(
+                pipe_uq - PIPE_WHITE_OFFSET_FROM_UQ
             )
             pipe_median = int(stats.median())
-            ball_tracker.set_pipe_median(pipe_median)
+            ball_tracker.set_threshold(
+                pipe_median - BALL_DARK_OFFSET_FROM_PIPE_MEDIAN
+            )
             terminal_print(
-                "[CAL] green pipe_med=%d ball_T=%d"
+                "[CAL] pipe_uq=%d pipe_med=%d pipe_T=%d ball_T=%d"
                 % (
+                    pipe_uq,
                     pipe_median,
+                    pipe_tracker.white_threshold,
                     ball_tracker.gray_threshold,
                 )
             )
         except Exception as error:
             terminal_print("[CAL] defaults used:", repr(error))
 
-        pipe = pipe_tracker.update(color_image, force=True)
+        # 使用更新后的阈值再精确锁定一次。
+        pipe = pipe_tracker.update(image, force=True)
         terminal_print(
             "[PIPE] lock x=%d y=%d w=%d h=%d"
             % (pipe.x(), pipe.y(), pipe.w(), pipe.h())
@@ -1334,17 +889,8 @@ def main():
             image = sensor.snapshot(chn=DETECT_CHANNEL)
             frame_count += 1
 
-            need_pipe_update = frame_count % PIPE_UPDATE_EVERY_N == 0
-            need_display = (
-                display_ok and frame_count % DISPLAY_EVERY_N == 0
-            )
-            color_image = None
-            if need_pipe_update or need_display:
-                # 管道识别与LCD刷新复用同一张RGB565图，避免重复抓图。
-                color_image = sensor.snapshot(chn=DISPLAY_CHANNEL)
-
-            if need_pipe_update:
-                pipe = pipe_tracker.update(color_image)
+            if frame_count % PIPE_UPDATE_EVERY_N == 0:
+                pipe = pipe_tracker.update(image)
             else:
                 pipe.fresh = False
 
@@ -1378,9 +924,11 @@ def main():
                 fps_start_ms = now_ms
                 fps_start_frames = frame_count
 
-            if need_display:
-                draw_debug(color_image, pipe, ball, fps)
-                Display.show_image(color_image, x=0, y=0)
+            if display_ok and frame_count % DISPLAY_EVERY_N == 0:
+                # 仅显示时抓取一次RGB565帧；检测仍使用灰度CH0。
+                display_image = sensor.snapshot(chn=DISPLAY_CHANNEL)
+                draw_debug(display_image, pipe, ball, fps)
+                Display.show_image(display_image, x=0, y=0)
 
             if (
                 ENABLE_TERMINAL_LOG
